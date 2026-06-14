@@ -12,12 +12,14 @@ import hmac
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -31,6 +33,14 @@ DEFAULT_PROFILE_INPUT = "https://www.tiktok.com/@beatswith_harnidh"
 DEFAULT_VIDEOS_DIR = Path(__file__).resolve().parent / "videos"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHARACTER_IMAGE_INPUT = PROJECT_ROOT / "characters" / "jessica.JPG"
+DEFAULT_INPUT_DIR = DEFAULT_VIDEOS_DIR / "input" / "source"
+DEFAULT_KLING_OUTPUT_DIR = DEFAULT_VIDEOS_DIR / "ai" / "base"
+DEFAULT_METADATA_DIR = DEFAULT_VIDEOS_DIR / "metadata"
+SOURCE_VIDEO_LEDGER_PATH = DEFAULT_METADATA_DIR / "source_videos.jsonl"
+SOURCE_HANDLE_ALIASES = {
+    "beatswith_harnidh": "beatsWithHarnidh",
+    "beatswithHarnidh": "beatsWithHarnidh",
+}
 METADATA_COLUMNS = [
     "video_id",
     "handle",
@@ -71,6 +81,19 @@ class KlingMotionControlResult:
     output_video_url: str
     output_path: Path
     metadata_path: Path
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SourceVideo:
+    source_video_id: str
+    source_handle: str
+    posted_at: datetime
+    video_url: str
+    input_path: Path
+    source_url: str
+    download_url: str
+    source_kind: str
     raw: dict[str, Any]
 
 
@@ -228,6 +251,189 @@ def append_metadata(metadata_path: Path, video: TikTokVideo, mp4_path: Path) -> 
         writer.writerow(row)
 
 
+def acquire_source_video(
+    profile_input: str = DEFAULT_PROFILE_INPUT,
+    *,
+    run_date: datetime | None = None,
+    input_dir: Path = DEFAULT_INPUT_DIR,
+    source_ledger_path: Path = SOURCE_VIDEO_LEDGER_PATH,
+    results_per_page: int = 30,
+) -> SourceVideo:
+    """Acquire the newest unused source video from Apify.
+
+    The source video ID is the primary lineage key. Once a source video is
+    written to the source ledger, it will not be selected again by this function.
+    """
+    token = os.environ.get("APIFY_TOKEN") or load_dotenv_value(PROJECT_ROOT / ".env", "APIFY_TOKEN")
+    if not token:
+        raise RuntimeError("Set APIFY_TOKEN before acquiring a source video")
+
+    handle = parse_profile_handle(profile_input)
+    actor_items = fetch_profile_posts_from_apify(build_actor_input(handle, results_per_page), token)
+    posts = sorted(
+        (normalize_post(item, handle) for item in actor_items),
+        key=lambda post: post.posted_at,
+        reverse=True,
+    )
+    used_source_video_ids = load_used_source_video_ids(source_ledger_path)
+    selected = next((post for post in posts if post.video_id and post.video_id not in used_source_video_ids), None)
+    if selected is None:
+        raise RuntimeError(f"No unused source videos found for @{handle}")
+    if not selected.download_url:
+        raise RuntimeError(f"Selected source video {selected.video_id} did not include a download URL")
+
+    current_run_date = run_date or datetime.now(timezone.utc)
+    source_handle = to_camel_handle(selected.handle or handle)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_path = input_dir / make_source_video_filename(current_run_date, source_handle, selected.video_id)
+
+    if not input_path.exists():
+        download_mp4(selected.download_url, input_path, token)
+
+    append_metadata(DEFAULT_VIDEOS_DIR / "metadata.csv", selected, input_path)
+    video_url = add_apify_token_to_url(selected.download_url)
+    source_video = SourceVideo(
+        source_video_id=selected.video_id,
+        source_handle=source_handle,
+        posted_at=selected.posted_at,
+        video_url=video_url,
+        input_path=input_path,
+        source_url=selected.source_url,
+        download_url=selected.download_url,
+        source_kind="apify",
+        raw=selected.raw,
+    )
+    append_source_video_ledger(source_ledger_path, source_video, current_run_date)
+    return source_video
+
+
+def use_pre_seed_videos(
+    pre_seed_paths: list[str | Path] | None = None,
+    *,
+    source_handle: str = "preSeed",
+    run_date: datetime | None = None,
+    input_dir: Path = DEFAULT_INPUT_DIR,
+    source_ledger_path: Path = SOURCE_VIDEO_LEDGER_PATH,
+) -> list[SourceVideo]:
+    """Register local warm-up videos as source videos.
+
+    If pre_seed_paths is omitted, this uses existing MP4s in videos/input.
+    Local pre-seed video IDs are stable content hashes with a preseed_ prefix.
+    """
+    current_run_date = run_date or datetime.now(timezone.utc)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    paths = [Path(path) for path in pre_seed_paths] if pre_seed_paths else sorted(input_dir.glob("*.mp4"))
+    used_source_video_ids = load_used_source_video_ids(source_ledger_path)
+    source_videos: list[SourceVideo] = []
+
+    for raw_path in paths:
+        source_path = resolve_local_path(raw_path.expanduser())
+        if not source_path.exists():
+            raise FileNotFoundError(f"Pre-seed video does not exist: {source_path}")
+        if source_path.suffix.lower() != ".mp4":
+            continue
+
+        source_video_id = f"preseed_{file_sha256(source_path)[:12]}"
+        if source_video_id in used_source_video_ids:
+            continue
+
+        normalized_handle = to_camel_handle(source_handle)
+        staged_path = input_dir / make_source_video_filename(current_run_date, normalized_handle, source_video_id)
+        if source_path.resolve() != staged_path.resolve() and not staged_path.exists():
+            shutil.copy2(source_path, staged_path)
+        video_url = upload_file_to_apify_kv(staged_path)
+
+        source_video = SourceVideo(
+            source_video_id=source_video_id,
+            source_handle=normalized_handle,
+            posted_at=current_run_date.astimezone(timezone.utc),
+            video_url=video_url,
+            input_path=staged_path,
+            source_url="",
+            download_url="",
+            source_kind="preseed",
+            raw={"original_path": str(source_path)},
+        )
+        append_source_video_ledger(source_ledger_path, source_video, current_run_date)
+        source_videos.append(source_video)
+        used_source_video_ids.add(source_video_id)
+
+    return source_videos
+
+
+def make_source_video_filename(run_date: datetime, source_handle: str, source_video_id: str) -> str:
+    return f"{sanitize_filename_part(source_video_id)}.mp4"
+
+
+def load_used_source_video_ids(source_ledger_path: Path = SOURCE_VIDEO_LEDGER_PATH) -> set[str]:
+    used_ids: set[str] = set()
+    if source_ledger_path.exists():
+        with source_ledger_path.open("r", encoding="utf-8") as ledger_file:
+            for line in ledger_file:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                source_video_id = item.get("source_video_id")
+                if source_video_id:
+                    used_ids.add(str(source_video_id))
+
+    metadata_path = DEFAULT_VIDEOS_DIR / "metadata.csv"
+    if metadata_path.exists():
+        with metadata_path.open("r", newline="", encoding="utf-8") as metadata_file:
+            for row in csv.DictReader(metadata_file):
+                video_id = row.get("video_id")
+                if video_id:
+                    used_ids.add(video_id)
+
+    return used_ids
+
+
+def append_source_video_ledger(source_ledger_path: Path, source_video: SourceVideo, run_date: datetime) -> None:
+    source_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "run_date": run_date.astimezone(timezone.utc).strftime("%Y%m%d"),
+        "source_video_id": source_video.source_video_id,
+        "source_handle": source_video.source_handle,
+        "posted_at_utc": source_video.posted_at.astimezone(timezone.utc).isoformat(),
+        "video_url": source_video.video_url,
+        "input_path": str(source_video.input_path),
+        "source_url": source_video.source_url,
+        "download_url": source_video.download_url,
+        "source_kind": source_video.source_kind,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "raw": source_video.raw,
+    }
+    with source_ledger_path.open("a", encoding="utf-8") as ledger_file:
+        ledger_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def to_camel_handle(value: str) -> str:
+    if value in SOURCE_HANDLE_ALIASES:
+        return SOURCE_HANDLE_ALIASES[value]
+
+    parts = [part for part in re.split(r"[^A-Za-z0-9]+", value) if part]
+    if not parts:
+        return "unknown"
+    first = parts[0][0].lower() + parts[0][1:]
+    return first + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def sanitize_filename_part(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
+    return sanitized or "unknown"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source_file:
+        while True:
+            chunk = source_file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def call_kling_motion_control(
     source_video_input: str | Path = DEFAULT_CHARACTER_IMAGE_INPUT,
     motion_video_input: str | Path | None = None,
@@ -240,7 +446,9 @@ def call_kling_motion_control(
     model_name: str = "kling-v2-6",
     poll_interval_seconds: int = 10,
     timeout_seconds: int = 900,
-    output_dir: Path = DEFAULT_VIDEOS_DIR / "kling_outputs",
+    output_dir: Path = DEFAULT_KLING_OUTPUT_DIR,
+    output_path: Path | None = None,
+    on_task_started: Callable[[str], None] | None = None,
 ) -> KlingMotionControlResult:
     """Create a Kling motion-control video through the direct Kling developer API.
 
@@ -284,15 +492,20 @@ def call_kling_motion_control(
     if not task_id:
         raise RuntimeError(f"Kling motion control did not return a task_id: {submit_result}")
     print(f"Kling motion-control task started: {task_id}", flush=True)
+    if on_task_started:
+        on_task_started(task_id)
 
     result_data = poll_kling_motion_control(task_id, token, poll_interval_seconds, timeout_seconds)
     output_video_url = extract_kling_video_url(result_data)
     if not output_video_url:
         raise RuntimeError(f"Kling motion control finished without a video URL: {result_data}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
-    output_path = output_dir / f"kling-motion-control-{timestamp}.mp4"
+    if output_path is None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+        output_path = output_dir / f"kling-motion-control-{timestamp}.mp4"
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = output_path.with_suffix(".json")
 
     download_mp4(output_video_url, output_path)
@@ -376,8 +589,6 @@ def extract_first_frame(video_path: Path) -> Path:
         "1",
         str(output_path),
     ]
-    import subprocess
-
     completed = subprocess.run(command, capture_output=True, text=True)
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg failed to extract first frame from {video_path}: {completed.stderr}")

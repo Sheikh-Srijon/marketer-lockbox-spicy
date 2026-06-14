@@ -1,0 +1,12 @@
+# Generated media and pipeline outputs
+videos/
+*.mp4
+*.mov
+*.webm
+*.m4v
+*.mp3
+*.wav
+.env
+.env.*
+__pycache__/
+._*
